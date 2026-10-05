@@ -16,14 +16,16 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass, field
-from functools import cached_property
 from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+LOGGER = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------------------------------------ template
@@ -47,48 +49,53 @@ class ChatTemplate:
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
+        self.caps = self._detect_caps()
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
-    @cached_property
-    def caps(self) -> dict[str, bool]:
-        """llama.cpp's capability names, checked once against this template and Strata's tool-call format.
+    def _detect_caps(self) -> dict[str, bool]:
+        """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
         These are rendering hints, not a guarantee that the model will follow a request."""
         def render(messages, tools=None):
             try:
                 return self.render(messages, tools=tools)
-            except Exception:
+            except jinja2.TemplateError as exc:
                 # A template may reject a role or feature. Discovery must still answer for its other features.
+                LOGGER.debug("chat template capability probe failed: %s", exc, exc_info=True)
                 return ""
 
         user = {"role": "user", "content": "strata_caps_user"}
-        tools = [{"name": "strata_caps_tool", "description": "strata_caps_description",
-                  "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}]
+        tools = [{"name": f"strata_caps_call_{i}", "description": "strata_caps_description",
+                  "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}
+                 for i in range(2)]
         tool_prompt = render([user], tools)
 
         def calls_supported(count):
             calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}}
                      for i in range(count)]
-            messages = [user, {"role": "assistant", "content": "", "tool_calls": calls}]
+            messages = [user, {"role": "assistant", "content": "",
+                               "tool_calls": [{"function": call} for call in calls]}]
             replies = [f"strata_caps_result_{i}" for i in range(count)]
             messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
-            prompt = render(messages)
-            parser = OutputParser(thinking=False)
+            prompt = render(messages, tools)
+            # Instructions include example XML and literal tag names, which are not model output. Parse only
+            # complete calls to our probe functions, using the same body parser as OutputParser.
+            bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
+                                prompt, re.S)
             try:
-                events = parser.feed(prompt) + parser.finish()
+                parsed = [parse_tool_call(body) for body in bodies]
             except ValueError:
                 return False
-            parsed = [{"name": e.call.name, "arguments": e.call.arguments}
-                      for e in events if e.kind == "tool_call"]
-            return parsed == calls and all(reply in prompt for reply in replies)
+            return [{"name": call.name, "arguments": call.arguments} for call in parsed] == calls \
+                and all(reply in prompt for reply in replies)
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
         return {"supports_tools": all(s in tool_prompt for s in
-                                      ("strata_caps_tool", "strata_caps_description", "<tool_call>", "<function=")),
+                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
                 "supports_tool_calls": calls_supported(1),
                 "supports_system_role": "strata_caps_system" in render(
                     [{"role": "system", "content": "strata_caps_system"}, user]),

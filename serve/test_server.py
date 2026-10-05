@@ -1578,6 +1578,20 @@ class SharedSettings(unittest.TestCase):
             self.svc.trusted_origins = []
 
 
+class TemplateCaps(unittest.TestCase):
+    def test_probe_errors_are_visible(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "chat_template.jinja"
+            path.write_text("{{ missing_global() }}", encoding="utf-8")
+            with self.assertLogs("serve.frontend", level="DEBUG") as logs:
+                caps = ChatTemplate(path).caps
+            self.assertFalse(any(caps.values()))
+            self.assertTrue(any("missing_global" in line for line in logs.output))
+            with mock.patch.object(ChatTemplate, "render", side_effect=RuntimeError("render bug")):
+                with self.assertRaisesRegex(RuntimeError, "render bug"):
+                    ChatTemplate(path).caps
+
+
 class WebApp(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
 
@@ -1688,7 +1702,13 @@ class WebApp(unittest.TestCase):
                  ("{% for m in messages %}{{ m.content }}{% if m.tool_calls %}"
                   "<tool_call>{{ m.tool_calls|tojson }}</tool_call>{% endif %}{% endfor %}",
                   {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": True,
-                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False})]
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False}),
+                 ("{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}"
+                  "{% set fn = c.function if c.function is defined else c %}"
+                  "{% if not tools or fn.name not in tools|map(attribute='name')|list %}"
+                  "{{ raise_exception('Tool calls require matching tool definitions.') }}"
+                  "{% endif %}{% endfor %}{% endif %}{% endfor %}" + source,
+                  {"supports_tools": True, "supports_tool_calls": True, "supports_parallel_tool_calls": True})]
         original = self.svc.template
         try:
             with tempfile.TemporaryDirectory() as d:
@@ -1703,6 +1723,24 @@ class WebApp(unittest.TestCase):
                         self.assertEqual(props["chat_template"], text)
                         for key, value in expected.items():
                             self.assertIs(props["chat_template_caps"][key], value)
+        finally:
+            self.svc.template = original
+
+    def test_props_caps_are_ready_for_concurrent_requests(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        original = self.svc.template
+        try:
+            self.svc.template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+            with mock.patch.object(self.svc.template, "render", side_effect=AssertionError("render during request")):
+                with ThreadPoolExecutor(max_workers=4) as pool:
+                    results = list(pool.map(lambda _: self.get("/props"), range(4)))
+            for code, _, body in results:
+                self.assertEqual(code, 200)
+                caps = json.loads(body)["chat_template_caps"]
+                for key in ("supports_tools", "supports_tool_calls", "supports_system_role",
+                            "supports_parallel_tool_calls", "supports_preserve_reasoning"):
+                    self.assertIs(caps[key], True)
         finally:
             self.svc.template = original
 
