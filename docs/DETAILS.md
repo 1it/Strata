@@ -481,7 +481,16 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
-`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. `chat_template_caps` says the template can do tools and keep thinking in the history (llama.cpp's names; Zed's llama.cpp provider reads this to offer tools). Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
+
+`chat_template_caps` uses llama.cpp's field names. Strata checks them once by rendering small requests with the
+active template; a rejected or omitted feature is `false`. `supports_tools` checks tool definitions and XML call
+instructions; `supports_tool_calls` checks that calls in the history use Strata's XML format and keep tool results.
+`supports_parallel_tool_calls` checks multiple calls in one assistant turn, and `supports_system_role` checks a
+leading system message. `supports_preserve_reasoning` means older assistant turns keep their `reasoning_content`
+in the rendered prompt. It does not describe whether a new reply returns reasoning. These are compatibility hints
+for clients, not a guarantee that the model will follow a request. Zed's llama.cpp provider reads this object to
+offer tools.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{

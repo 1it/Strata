@@ -1659,9 +1659,9 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(props["default_generation_settings"]["params"],
                                  {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
                 self.assertEqual(props["chat_template"], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
-                self.assertEqual(props["chat_template_caps"],
-                                 {"supports_tools": True, "supports_tool_calls": True, "supports_system_role": True,
-                                  "supports_parallel_tool_calls": True, "supports_preserve_reasoning": True})
+                for key in ("supports_tools", "supports_tool_calls", "supports_system_role",
+                            "supports_parallel_tool_calls", "supports_preserve_reasoning"):
+                    self.assertIs(props["chat_template_caps"][key], True)
                 self.assertEqual(props["modalities"]["vision"], vision is not None)
                 self.assertEqual(props["total_slots"], 1)
                 self.assertFalse(props["models_autoload"])
@@ -1671,6 +1671,40 @@ class WebApp(unittest.TestCase):
             self.assertEqual(self.get("/props?model=not-loaded&autoload=true")[0], 404)
         finally:
             svc.engine.max_context, svc.vision, svc.sampling_defaults, svc.shared = previous
+
+    def test_props_caps_follow_the_active_template(self):
+        source = self.svc.template.source
+        cases = [("{# tools tool_calls reasoning_content <tool_call> <function= #}{{ messages[-1].content }}",
+                  {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": False,
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False}),
+                 ("{% set preserve_thinking = false %}" + source, {"supports_preserve_reasoning": False}),
+                 ("{% for m in messages %}{% if m.tool_calls and m.tool_calls|length > 1 %}"
+                  "{{ raise_exception('Only one tool call is supported.') }}{% endif %}{% endfor %}" + source,
+                  {"supports_tool_calls": True, "supports_parallel_tool_calls": False}),
+                 ("{% if tools or messages[0].role == 'system' %}{{ raise_exception('Unsupported.') }}{% endif %}"
+                  "{{ messages[-1].content }}",
+                  {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": False,
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False}),
+                 ("{% for m in messages %}{{ m.content }}{% if m.tool_calls %}"
+                  "<tool_call>{{ m.tool_calls|tojson }}</tool_call>{% endif %}{% endfor %}",
+                  {"supports_tools": False, "supports_tool_calls": False, "supports_system_role": True,
+                   "supports_parallel_tool_calls": False, "supports_preserve_reasoning": False})]
+        original = self.svc.template
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                path = Path(d) / "chat_template.jinja"
+                for text, expected in cases:
+                    with self.subTest(expected=expected):
+                        path.write_text(text, encoding="utf-8")
+                        self.svc.template = ChatTemplate(path)
+                        code, _, body = self.get("/props")
+                        self.assertEqual(code, 200)
+                        props = json.loads(body)
+                        self.assertEqual(props["chat_template"], text)
+                        for key, value in expected.items():
+                            self.assertIs(props["chat_template_caps"][key], value)
+        finally:
+            self.svc.template = original
 
     def test_discovery_needs_the_api_key(self):
         self.svc.api_key = "secret"

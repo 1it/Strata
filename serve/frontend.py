@@ -19,6 +19,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 import jinja2
@@ -51,6 +52,48 @@ class ChatTemplate:
                **kwargs) -> str:
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
+
+    @cached_property
+    def caps(self) -> dict[str, bool]:
+        """llama.cpp's capability names, checked once against this template and Strata's tool-call format.
+        These are rendering hints, not a guarantee that the model will follow a request."""
+        def render(messages, tools=None):
+            try:
+                return self.render(messages, tools=tools)
+            except Exception:
+                # A template may reject a role or feature. Discovery must still answer for its other features.
+                return ""
+
+        user = {"role": "user", "content": "strata_caps_user"}
+        tools = [{"name": "strata_caps_tool", "description": "strata_caps_description",
+                  "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}]
+        tool_prompt = render([user], tools)
+
+        def calls_supported(count):
+            calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}}
+                     for i in range(count)]
+            messages = [user, {"role": "assistant", "content": "", "tool_calls": calls}]
+            replies = [f"strata_caps_result_{i}" for i in range(count)]
+            messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
+            prompt = render(messages)
+            parser = OutputParser(thinking=False)
+            try:
+                events = parser.feed(prompt) + parser.finish()
+            except ValueError:
+                return False
+            parsed = [{"name": e.call.name, "arguments": e.call.arguments}
+                      for e in events if e.kind == "tool_call"]
+            return parsed == calls and all(reply in prompt for reply in replies)
+
+        history = [user, {"role": "assistant", "content": "strata_caps_answer",
+                          "reasoning_content": "strata_caps_reasoning"}, user]
+        return {"supports_tools": all(s in tool_prompt for s in
+                                      ("strata_caps_tool", "strata_caps_description", "<tool_call>", "<function=")),
+                "supports_tool_calls": calls_supported(1),
+                "supports_system_role": "strata_caps_system" in render(
+                    [{"role": "system", "content": "strata_caps_system"}, user]),
+                "supports_parallel_tool_calls": calls_supported(2),
+                "supports_preserve_reasoning": "strata_caps_reasoning" in render(history)}
 
 
 # ------------------------------------------------------------------------------------------------ requests
