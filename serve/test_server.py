@@ -1659,6 +1659,9 @@ class WebApp(unittest.TestCase):
                 self.assertEqual(props["default_generation_settings"]["params"],
                                  {"temperature": 0.7, "repeat_penalty": 1.1, "n_predict": 4096})
                 self.assertEqual(props["chat_template"], (ROOT / "serve/chat_template.jinja").read_text(encoding="utf-8"))
+                self.assertEqual(props["chat_template_caps"],
+                                 {"supports_tools": True, "supports_tool_calls": True, "supports_system_role": True,
+                                  "supports_parallel_tool_calls": True, "supports_preserve_reasoning": True})
                 self.assertEqual(props["modalities"]["vision"], vision is not None)
                 self.assertEqual(props["total_slots"], 1)
                 self.assertFalse(props["models_autoload"])
