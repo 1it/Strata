@@ -5223,7 +5223,7 @@ def main() -> int:
             os.fsync(f.fileno())
         # A pack made before the replacement cannot be reused.
         for name in ("index.txt", "manifest.json", "native_experts.txt", "experts.bin", "experts.bin.src.json",
-                     "tokenizer/vocab.json"):
+                     "tokenizer/vocab.json", "tokenizer/chat_template.jinja"):
             (pack / name).unlink(missing_ok=True)
 
     # ---- 5. the model files

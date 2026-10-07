@@ -22,8 +22,11 @@ from test_setup_golden import PROFILES, install  # noqa: E402
 from test_setup_pins import Response  # noqa: E402
 
 
-def gguf_bytes():
-    data = bytearray(struct.pack("<IIQQ", 0x46554747, 3, 2, 0))
+def gguf_bytes(template=None):
+    data = bytearray(struct.pack("<IIQQ", 0x46554747, 3, 2, int(template is not None)))
+    if template is not None:
+        key, value = b"tokenizer.chat_template", template.encode()
+        data += struct.pack("<Q", len(key)) + key + struct.pack("<IQ", 8, len(value)) + value
     for i, name in enumerate(("blk.0.attn_q.weight", "blk.0.attn_k.weight")):
         data += struct.pack("<Q", len(name)) + name.encode() + struct.pack("<IQIQ", 1, 8, 0, 32 * i)
     return bytes(data) + bytes(-len(data) % 32 + 64)
@@ -305,6 +308,46 @@ class Setup(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual([path for path, _ in calls], [*self.shards, encoder])
         self.assertEqual(len(builds), 1)
+
+    def test_forced_rebuild_uses_only_the_replacement_chat_template(self):
+        import strata_tokenizer
+        from gguf_reader import GGUFFile
+        from types import SimpleNamespace
+
+        data, pack = self.old_pack()
+        template_path = pack / "tokenizer/chat_template.jinja"
+        tokenizer = SimpleNamespace(pre="qwen35", tokens=["x"], ids={"x": 0}, ranks={},
+                                    token_types=[1], special_ids={})
+        for avx512 in (False, True):
+            for template in (None, "replacement model template"):
+                with self.subTest(avx512=avx512, template=template):
+                    template_path.write_text("previous model template", encoding="utf-8")
+                    builds = []
+
+                    def download(url, dst, what=None, **kwargs):
+                        dst.write_bytes(gguf_bytes(template))
+                        setup.mark(dst)
+
+                    def build(cmd, **kwargs):
+                        if Path(cmd[1]).name in ("iq_pack.py", "strata_tokenizer.py"):
+                            # Run the real exporter with a small vocabulary and real replacement GGUF metadata.
+                            with mock.patch.object(strata_tokenizer.Tokenizer, "from_gguf", return_value=tokenizer), \
+                                    mock.patch.dict(sys.modules, {"gguf_reader": SimpleNamespace(GGUFFile=GGUFFile)}):
+                                strata_tokenizer.extract(self.shards[0], pack)
+                            builds.append(cmd)
+
+                    code, out, _, _ = install(self.ram, self.cards,
+                        [*self.argv, "--force-download", "--vision", "none"], avx512=avx512, extra=[
+                            mock.patch.object(setup, "data_folder", return_value=(data, [])),
+                            mock.patch.object(setup, "download", download), mock.patch.object(setup, "run", build)])
+                    self.assertEqual(code, 0, out)
+                    self.assertEqual(len(builds), 1)
+                    if template is None:
+                        self.assertFalse(template_path.exists())
+                    else:
+                        self.assertEqual(template_path.read_text(encoding="utf-8"), template)
+                    self.assertTrue((pack / "tokenizer/vocab.json").exists())
+                    self.assertEqual((pack / "keep.txt").read_bytes(), b"old cache")
 
     def test_failed_replacement_blocks_repacking_until_a_full_forced_retry(self):
         data, pack = self.old_pack()
