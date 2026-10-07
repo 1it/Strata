@@ -95,6 +95,57 @@ class Downloads(unittest.TestCase):
         self.assertEqual(self.dst.read_bytes(), self.original)
         self.assertEqual(self.dst.with_name("model.gguf.done").read_text(), "old marker")
 
+    def test_invalid_forced_replacements_preserve_the_file_and_mark(self):
+        expected = (len(self.original), hashlib.sha256(self.original).hexdigest())
+        cases = ((self.original[:-1] + b"x", expected), (self.original, (len(self.original) + 1, expected[1])),
+                 (b"invalid GGUF".ljust(len(self.original), b"x"), None))
+        for data, pinned in cases:
+            for local in (False, True):
+                with self.subTest(pinned=pinned, local=local):
+                    setup.mark(self.dst, "old marker")
+                    src = self.root / "mirror.gguf"
+                    src.write_bytes(data)
+                    # A hash left by an earlier staged transfer must never skip checking the new bytes.
+                    self.dst.with_name("model.gguf.part.done").write_text("sha256 " + expected[1])
+                    with mock.patch.object(setup.urllib.request, "urlopen", side_effect=lambda *a, **k: Response(data)), \
+                            self.assertRaises(SystemExit):
+                        setup.download(str(src) if local else "https://example.com/model.gguf", self.dst,
+                                       force=True, expected=pinned)
+                    self.assertEqual(self.dst.read_bytes(), self.original)
+                    self.assertEqual(self.dst.with_name("model.gguf.done").read_text(), "old marker")
+
+    def test_modelscope_hash_is_checked_before_a_forced_replacement(self):
+        new = self.original[:-1] + b"x"
+        sha = hashlib.sha256(self.original).hexdigest()
+        setup.mark(self.dst, "old marker")
+        with mock.patch.object(setup, "model_source", return_value="modelscope"), \
+                mock.patch.object(setup, "ms_file", return_value=("repo", "file")), \
+                mock.patch.object(setup, "ms_url", return_value="https://example.com/model.gguf"), \
+                mock.patch.object(setup, "reachable", return_value=True), \
+                mock.patch.object(setup, "ms_meta", return_value=(len(new), sha)), \
+                mock.patch.object(setup.urllib.request, "urlopen", side_effect=lambda *a, **k: Response(new)), \
+                self.assertRaises(SystemExit):
+            setup.download("https://example.com/model.gguf", self.dst, force=True)
+        self.assertEqual(self.dst.read_bytes(), self.original)
+        self.assertEqual(self.dst.with_name("model.gguf.done").read_text(), "old marker")
+
+    def test_a_valid_pinned_replacement_is_verified_then_published(self):
+        new = self.original[:-1] + b"x"
+        sha = hashlib.sha256(new).hexdigest()
+        verify = setup.verify_sha256
+
+        def check(path, *args, **kwargs):
+            self.assertEqual(path.name, "model.gguf.part")
+            self.assertEqual(self.dst.read_bytes(), self.original)
+            return verify(path, *args, **kwargs)
+
+        with mock.patch.object(setup.urllib.request, "urlopen", side_effect=lambda *a, **k: Response(new)), \
+                mock.patch.object(setup, "verify_sha256", side_effect=check):
+            setup.download("https://example.com/model.gguf", self.dst, force=True, expected=(len(new), sha))
+        self.assertEqual(self.dst.read_bytes(), new)
+        self.assertEqual(self.dst.with_name("model.gguf.done").read_text(), "sha256 " + sha)
+        self.assertFalse(self.dst.with_name("model.gguf.part.done").exists())
+
     def test_local_force_copy_replaces_only_after_copy_finishes(self):
         src = self.root / "new.gguf"
         src.write_bytes(self.original[:-1] + b"x")
@@ -137,6 +188,16 @@ class Setup(unittest.TestCase):
             shard.write_bytes(gguf_bytes())
         self.argv = ["--models-dir", str(self.models), "--family", "qwen", "--model", "Q2_0", "--no-start"]
         self.ram, self.cards = PROFILES["64GB-1x32GB"]
+
+    def old_pack(self):
+        data = Path(self.tmp.name) / "data"
+        pack = data / "packs/q2_0"
+        (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
+        for name in ("index.txt", "native_experts.txt", "experts.bin", "tokenizer/vocab.json", "keep.txt"):
+            (pack / name).write_bytes(b"old cache")
+        (data / "mtp/rt").mkdir(parents=True)
+        (data / "mtp/rt/experts.bin").touch()
+        return data, pack
 
     def test_whole_unmarked_shards_are_reused_even_without_writable_marks(self):
         # setup's harness mocks GGUF parsing; the download tests above exercise the real header reader.
@@ -186,6 +247,98 @@ class Setup(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual([path for path, _ in calls], [*self.shards, encoder])
         self.assertEqual(len(builds), 1)
+
+    def test_failed_replacement_is_rebuilt_on_a_normal_retry(self):
+        data, pack = self.old_pack()
+        for shard in self.shards:
+            setup.mark(shard)
+        replacement = gguf_bytes()[:-1] + b"x"
+        calls = []
+
+        def download(url, dst, what=None, **kwargs):
+            self.assertFalse((pack / "index.txt").exists())
+            self.assertFalse((pack / "native_experts.txt").exists())
+            self.assertFalse((pack / "tokenizer/vocab.json").exists())
+            calls.append(dst)
+            if len(calls) == 2:
+                raise SystemExit(1)
+            dst.write_bytes(replacement)
+            setup.mark(dst)
+
+        folder = mock.patch.object(setup, "data_folder", return_value=(data, []))
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--force-download", "--vision", "none"], extra=[
+            folder, mock.patch.object(setup, "download", download)])
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.shards[0].read_bytes(), replacement)
+        self.assertEqual(self.shards[1].read_bytes(), gguf_bytes())
+        self.assertFalse((pack / "experts.bin").exists())
+        builds = []
+
+        def build(cmd, **kwargs):
+            if "iq_pack.py" in cmd[1]:
+                self.assertEqual(Path(cmd[cmd.index("--out") + 1]), pack)
+                builds.append(cmd)
+                (pack / "native_experts.txt").write_bytes(b"rebuilt")
+                (pack / "tokenizer/vocab.json").write_bytes(b"rebuilt")
+
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--vision", "none"], extra=[
+            mock.patch.object(setup, "data_folder", return_value=(data, [])),
+            mock.patch.object(setup, "download", side_effect=AssertionError("downloaded complete shards")),
+            mock.patch.object(setup, "run", build)])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(len(builds), 1)
+        self.assertEqual((pack / "keep.txt").read_bytes(), b"old cache")
+
+    def test_force_passes_pinned_hashes_to_staged_validation(self):
+        for shard in self.shards:
+            setup.mark(shard, "old marker")
+        pinned = {shard.name: (len(gguf_bytes()), hashlib.sha256(gguf_bytes()).hexdigest()) for shard in self.shards}
+        family = {**self.fam, "sha256": pinned}
+        real_download, real_verify = setup.download, setup.verify_sha256
+        new = gguf_bytes()[:-1] + b"x"
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--force-download", "--vision", "none"], extra=[
+            mock.patch.dict(setup.FAMILIES, {"qwen": family}),
+            mock.patch.object(setup, "download", real_download),
+            mock.patch.object(setup, "verify_sha256", real_verify),
+            mock.patch.object(setup, "whole_shard", return_value=True),
+            mock.patch.object(setup.urllib.request, "urlopen", side_effect=lambda *a, **k: Response(new))])
+        self.assertEqual(code, 1, out)
+        self.assertIn("wrong SHA-256", out)
+        for shard in self.shards:
+            self.assertEqual(shard.read_bytes(), gguf_bytes())
+            self.assertEqual(shard.with_name(shard.name + ".done").read_text(), "old marker")
+
+    def test_disk_check_counts_missing_shards_and_replacement_space(self):
+        fam = setup.FAMILIES["unsloth"]
+        for i in (1, 3):
+            shard = self.models / "UD-IQ4_XS" / setup.model_file(fam, "UD-IQ4_XS", i)
+            shard.parent.mkdir(parents=True, exist_ok=True)
+            with shard.open("wb") as f:
+                f.truncate(fam["sha256"][shard.name][0])  # sparse files: real sizes without allocating 44 GB
+            setup.mark(shard)
+        download = mock.Mock(side_effect=AssertionError("passed an insufficient disk check"))
+        code, out, _, _ = install(self.ram, self.cards, ["--models-dir", str(self.models), "--family", "unsloth",
+            "--model", "UD-IQ4_XS", "--force-download", "--vision", "none", "--no-start"], extra=[
+                mock.patch.object(setup, "free_gb", return_value=60),
+                mock.patch.object(setup, "download", download)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("not enough free disk space", out)
+        self.assertIn("need ~96 GB", out)
+        download.assert_not_called()
+
+    def test_disk_check_reserves_space_to_rebuild_a_forced_pack(self):
+        data, pack = self.old_pack()
+        for shard in self.shards:
+            setup.mark(shard)
+        download = mock.Mock(side_effect=AssertionError("passed an insufficient disk check"))
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--force-download", "--vision", "none"],
+            avx512=True, extra=[mock.patch.object(setup, "data_folder", return_value=(data, [])),
+                mock.patch.object(setup, "free_gb", return_value=20),
+                mock.patch.object(setup, "download", download)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("need ~42 GB", out)
+        self.assertTrue((pack / "experts.bin").exists())
+        download.assert_not_called()
 
     def test_force_conflicts_are_rejected_before_installation(self):
         for flags in (["--gguf-dir", str(self.models)], ["--check"], ["--update"], ["--rollback-engine"]):

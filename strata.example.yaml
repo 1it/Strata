@@ -5,7 +5,7 @@ model: iq2_xs
 # config: strata-coder-q2_0.json
 
 # The full context in tokens, including prompt and answer. Omit to keep setup's size.
-context: 32768
+# context: 32768
 # Optional engine settings; omitted settings keep setup's values.
 # kv: int8                    # fp16 | int8 | q4_0 | k8v4
 # vram_reserve_mib: 2048       # leave this much VRAM free for other programs

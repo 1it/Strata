@@ -170,6 +170,19 @@ class Launch(unittest.TestCase):
             run.main(["init", "--config", str(self.path)])
         self.assertEqual(self.path.read_bytes(), earlier)
 
+    def test_init_inherits_small_and_large_installed_contexts(self):
+        for context in (8192, 131072):
+            with self.subTest(context=context):
+                self.path.unlink(missing_ok=True)
+                self.cfg["args"][self.cfg["args"].index("--max-context") + 1] = str(context)
+                self.base.write_text(json.dumps(self.cfg))
+                with mock.patch.object(launchconfig, "installed", return_value={"coder-q2_0": self.base}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(run.main(["init", "--config", str(self.path)]), 0)
+                    cfg = launchconfig.load(self.path)
+                self.assertNotIn("context", yaml.safe_load(self.path.read_text()))
+                self.assertEqual(cfg["args"], self.cfg["args"])
+
     def test_cli_host_override_is_checked_before_the_socket_or_engine(self):
         self.write()
         from serve import server

@@ -282,8 +282,10 @@ To replace this model's files explicitly, stop Strata and run:
 
 On Windows use `START-HERE.bat` with the same flags. Name `--family` too for Swift, Coder or Unsloth. This downloads
 the selected model's shards and its enabled vision encoder afresh, even when completion marks or matching sizes
-are present, and rebuilds the prepared pack from the new files. Each old file stays until its new transfer
-finishes; fresh transfers need room for the old shard and its replacement together. The flag does not replace
+are present, and rebuilds the prepared pack from the new files. Each old file and its finish mark stay until
+the staged replacement passes its GGUF and available published or pinned SHA-256 checks. The pack is invalidated
+before any shard changes, so a failed replacement's normal setup retry rebuilds it. Fresh transfers need room
+for missing shards, the old shard and its replacement together, and pack regeneration. The flag does not replace
 the shared MTP draft layer or engine. It cannot be combined with `--gguf-dir`, `--check`, `--update` or
 `--rollback-engine`.
 
