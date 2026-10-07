@@ -1267,6 +1267,58 @@ def free_gb(path):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
+REPLACEMENT_INCOMPLETE = ".strata-replacement-incomplete"
+
+
+def replacement_space(shards: list[Path], sizes: list[int]) -> int:
+    """Peak additional bytes in download order: stage a shard, then release its old file."""
+    def released(path):
+        if not path.is_file() or path.is_symlink():
+            return 0
+        stat = path.stat()
+        return stat.st_size if stat.st_nlink == 1 else 0  # another model may still hold a hard link
+
+    used = peak = 0
+    for shard, size in zip(shards, sizes):
+        part = shard.with_name(shard.name + ".part")
+        used -= released(part)                       # force discards this just before its transfer
+        peak = max(peak, used + size)
+        used += size - released(shard)
+    return peak
+
+
+def download_info(url, what=None):
+    """The selected source URL, transfer size and ModelScope identity; no file bytes downloaded."""
+    ms = ms_file(url) if model_source() == "modelscope" else None
+    if ms is not None:
+        if reachable(ms_url(*ms), timeout=30):
+            url = ms_url(*ms)
+        else:
+            warn(f"{what or url.rsplit('/', 1)[-1]}: ModelScope does not answer; downloading it from {hf_endpoint()}")
+            ms = None
+    for attempt in range(5):
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                total = int(r.headers.get("Content-Length", 0))
+            return url, total, ms
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and hf_unpinned(url) != url:
+                warn(f"{what or url.rsplit('/', 1)[-1]}: not at the pinned revision any more; downloading the "
+                     "repository's current file")
+                url = hf_unpinned(url)
+                continue
+            if attempt == 4:
+                fail(f"cannot reach {url.split('/')[2]} ({e})",
+                     "check your internet connection and run it again" + source_hint(url))
+            time.sleep(5)
+        except OSError as e:
+            if attempt == 4:
+                fail(f"cannot reach {url.split('/')[2]} ({e})",
+                     "check your internet connection and run it again" + source_hint(url))
+            time.sleep(5)
+
+
 def drop_archive(z: Path) -> None:
     """An unpacked or refused engine archive and its .done mark go: a refused one kept them, and every later run
     reused it ("already downloaded") instead of the published one (PR #324)."""
@@ -1293,7 +1345,7 @@ def finish_download(part: Path, dst: Path, *, force=False, expected=None, meta=N
         mark(dst)
 
 
-def download(url, dst: Path, what=None, *, force=False, expected=None):
+def download(url, dst: Path, what=None, *, force=False, expected=None, info=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark. Existing GGUFs without one are checked locally and reused;
     an incomplete existing GGUF is left alone unless force=True. Forced transfers use .part and replace
@@ -1322,34 +1374,7 @@ def download(url, dst: Path, what=None, *, force=False, expected=None):
         finish_download(part, dst, force=force, expected=expected)
         ok(f"{what or dst.name} copied")
         return
-    ms = ms_file(url) if model_source() == "modelscope" else None
-    if ms is not None:
-        if reachable(ms_url(*ms), timeout=30):
-            url = ms_url(*ms)
-        else:
-            warn(f"{what or dst.name}: ModelScope does not answer; downloading it from {hf_endpoint()}")
-            ms = None
-    total = 0
-    for attempt in range(5):
-        try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
-            total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
-            break
-        except urllib.error.HTTPError as e:
-            if e.code == 404 and hf_unpinned(url) != url:  # #214: the pinned revision is gone from the repository
-                warn(f"{what or dst.name}: not at the pinned revision any more; downloading the repository's "
-                     "current file")
-                url = hf_unpinned(url)
-                continue
-            if attempt == 4:
-                fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + source_hint(url))
-            time.sleep(5)
-        except OSError as e:
-            if attempt == 4:
-                fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + source_hint(url))
-            time.sleep(5)
+    url, total, ms = info if info is not None else download_info(url, what or dst.name)
     if not force and dst.exists() and total and dst.stat().st_size == total:  # older setup, no mark yet
         mark(dst)
         ok(f"{what or dst.name} already downloaded")
@@ -5089,10 +5114,13 @@ def main() -> int:
     problem = gguf_dir_problem(models_dir, shards[0], fam, model) if a.gguf_dir else None
     if problem:                                        # #444: files Strata cannot run, or another choice's files
         fail(*problem)
+    if not a.force_download and (models_dir / REPLACEMENT_INCOMPLETE).exists():
+        fail(f"model replacement is incomplete in {models_dir}; these shards cannot be repacked",
+             "rerun setup for this model with --force-download to replace the entire shard set")
     if not a.force_download and not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
         for r in elsewhere:                            # already downloaded in a Strata folder on another drive
             cand = [r / "models" / tag / sh.name for sh in shards]
-            if all(c.exists() and done(c) for c in cand):
+            if not (cand[0].parent / REPLACEMENT_INCOMPLETE).exists() and all(c.exists() and done(c) for c in cand):
                 models_dir, shards = cand[0].parent, cand
                 ok(f"model files found in {models_dir}")
                 break
@@ -5111,9 +5139,24 @@ def main() -> int:
     on_disk = sum(f.stat().st_size for s in shards for f in
                   ((s,) if a.force_download else (s, s.with_name(s.name + ".part"))) if f.is_file()) / 1e9
     to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
+    transfers = {}
     if a.force_download:
-        # Shards are replaced one at a time; the old one and its new .part coexist during the transfer.
-        to_fetch += max((s.stat().st_size / 1e9 for s in shards if s.is_file()), default=0)
+        sizes = []
+        for s in shards:
+            pinned = fam.get("sha256", {}).get(s.name)
+            if pinned:
+                sizes.append(pinned[0])
+            else:
+                info = download_info(fam["hf"].format(q=model) + s.name, s.name)
+                transfers[s] = info
+                size = info[1]
+                if not size and info[2] is not None:
+                    size = (ms_meta(*info[2]) or (0, ""))[0]
+                if not size:
+                    # Without a per-file size, the whole published model size bounds this shard's estimate.
+                    warn(f"{s.name}: the source reports no size; using a conservative disk estimate")
+                sizes.append(size or math.ceil(MODELS[model]["download_gb"] * 1e9))
+        to_fetch = replacement_space(shards, sizes) / 1e9
     # count only what step 6 will still write: a pack whose experts.bin is already there (the AVX-512 Q2_0
     # conversion, or the low-RAM mode's copy) and an existing MTP draft layer need no new room
     pack_now = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
@@ -5170,8 +5213,15 @@ def main() -> int:
     ok(f"engine: {eng / EXE}")
 
     pack = pack_now
+    replacement = models_dir / REPLACEMENT_INCOMPLETE
     if a.force_download:
-        # Invalidate before any shard changes: an interrupted replacement's normal retry must rebuild too.
+        # Persist before any shard can change. A normal retry must not repack a mixture of old and new revisions.
+        models_dir.mkdir(parents=True, exist_ok=True)
+        with replacement.open("w", encoding="utf-8") as f:
+            f.write(f"Incomplete replacement of {tag}: rerun setup with --force-download.\n")
+            f.flush()
+            os.fsync(f.fileno())
+        # A pack made before the replacement cannot be reused.
         for name in ("index.txt", "manifest.json", "native_experts.txt", "experts.bin", "experts.bin.src.json",
                      "tokenizer/vocab.json"):
             (pack / name).unlink(missing_ok=True)
@@ -5199,7 +5249,8 @@ def main() -> int:
                 ok(f"{s.name} already downloaded")
                 continue
             # the original's shard 2 is the same file for all its sizes and the Coder: reuse one that is already here
-            other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf") if done(p)]
+            other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf")
+                     if done(p) and not (p.parent / REPLACEMENT_INCOMPLETE).exists()]
             if not a.force_download and family in ("qwen", "coder") and \
                     s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
                 try:
@@ -5210,7 +5261,8 @@ def main() -> int:
                 except OSError:
                     pass
             download(fam["hf"].format(q=model) + s.name, s,
-                     **({"force": True, "expected": fam.get("sha256", {}).get(s.name)} if a.force_download else {}))
+                     **({"force": True, "expected": fam.get("sha256", {}).get(s.name), "info": transfers.get(s)}
+                        if a.force_download else {}))
     check_shards(shards)
     for s in shards:                                   # the Unsloth files: pinned sizes and SHA-256
         if s.name in fam.get("sha256", {}):
@@ -5230,6 +5282,10 @@ def main() -> int:
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
+
+    if a.force_download:
+        # Only the complete, validated shard/encoder set can be repacked. Later pack failures can retry normally.
+        replacement.unlink()
 
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")

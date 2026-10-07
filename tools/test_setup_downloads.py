@@ -170,10 +170,65 @@ class Downloads(unittest.TestCase):
         self.assertEqual(calls, [("HEAD", None), ("GET", "bytes=32-")])
         self.assertEqual(self.dst.read_bytes(), self.original)
 
+    def test_forced_download_reuses_its_disk_planning_head_information(self):
+        new = self.original[:-1] + b"x"
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(req.get_method())
+            return Response(new)
+
+        with mock.patch.object(setup.urllib.request, "urlopen", urlopen):
+            info = setup.download_info("https://example.com/model.gguf")
+            setup.download("https://example.com/model.gguf", self.dst, force=True, info=info)
+        self.assertEqual(calls, ["HEAD", "GET"])
+        self.assertEqual(self.dst.read_bytes(), new)
+
     def test_a_local_file_with_the_wrong_pinned_hash_can_be_preserved(self):
         with self.assertRaises(SystemExit):
             setup.verify_sha256(self.dst, len(self.original), "0" * 64, remove_bad=False)
         self.assertEqual(self.dst.read_bytes(), self.original)
+
+
+class ReplacementSpace(unittest.TestCase):
+    def test_peak_follows_shard_order_and_released_files(self):
+        cases = (("missing last", (10, 50, None), (10, 50, 44), 50),
+                 ("missing middle", (10, None, 44), (10, 50, 44), 94),
+                 ("all present", (10, 50, 44), (10, 50, 44), 50),
+                 ("all missing", (None, None, None), (10, 50, 44), 104),
+                 ("growing", (10, 20, 30), (20, 40, 60), 90),
+                 ("shrinking", (40, 40, 40), (20, 20, 20), 20))
+        for name, old, new, peak in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                shards = [Path(tmp) / f"shard-{i}.gguf" for i in range(3)]
+                for shard, size in zip(shards, old):
+                    if size is not None:
+                        shard.write_bytes(bytes(size))
+                self.assertEqual(setup.replacement_space(shards, list(new)), peak)
+
+    def test_discarded_partial_space_is_released_in_transfer_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shards = [Path(tmp) / f"shard-{i}.gguf" for i in range(3)]
+            shards[0].write_bytes(bytes(10))
+            shards[2].write_bytes(bytes(44))
+            shards[1].with_name(shards[1].name + ".part").write_bytes(bytes(30))
+            self.assertEqual(setup.replacement_space(shards, [10, 50, 44]), 64)
+
+    def test_linked_shards_do_not_release_their_targets_space(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as tmp:
+                shards = [Path(tmp) / f"shard-{i}.gguf" for i in range(3)]
+                shards[0].write_bytes(bytes(10))
+                source = Path(tmp) / "shared.gguf"
+                source.write_bytes(bytes(50))
+                if symlink:
+                    try:
+                        shards[1].symlink_to(source)
+                    except OSError:
+                        continue                       # Windows may require permission to create symlinks
+                else:
+                    setup.os.link(source, shards[1])
+                self.assertEqual(setup.replacement_space(shards, [10, 50, 44]), 94)
 
 
 class Setup(unittest.TestCase):
@@ -188,6 +243,9 @@ class Setup(unittest.TestCase):
             shard.write_bytes(gguf_bytes())
         self.argv = ["--models-dir", str(self.models), "--family", "qwen", "--model", "Q2_0", "--no-start"]
         self.ram, self.cards = PROFILES["64GB-1x32GB"]
+        info = mock.patch.object(setup, "download_info", side_effect=lambda url, what=None: (url, len(gguf_bytes()), None))
+        info.start()
+        self.addCleanup(info.stop)
 
     def old_pack(self):
         data = Path(self.tmp.name) / "data"
@@ -248,14 +306,16 @@ class Setup(unittest.TestCase):
         self.assertEqual([path for path, _ in calls], [*self.shards, encoder])
         self.assertEqual(len(builds), 1)
 
-    def test_failed_replacement_is_rebuilt_on_a_normal_retry(self):
+    def test_failed_replacement_blocks_repacking_until_a_full_forced_retry(self):
         data, pack = self.old_pack()
+        pending = self.shards[0].parent / setup.REPLACEMENT_INCOMPLETE
         for shard in self.shards:
             setup.mark(shard)
         replacement = gguf_bytes()[:-1] + b"x"
         calls = []
 
         def download(url, dst, what=None, **kwargs):
+            self.assertTrue(pending.exists())
             self.assertFalse((pack / "index.txt").exists())
             self.assertFalse((pack / "native_experts.txt").exists())
             self.assertFalse((pack / "tokenizer/vocab.json").exists())
@@ -272,10 +332,12 @@ class Setup(unittest.TestCase):
         self.assertEqual(self.shards[0].read_bytes(), replacement)
         self.assertEqual(self.shards[1].read_bytes(), gguf_bytes())
         self.assertFalse((pack / "experts.bin").exists())
+        self.assertTrue(pending.exists())
         builds = []
 
         def build(cmd, **kwargs):
             if "iq_pack.py" in cmd[1]:
+                self.assertFalse(pending.exists())
                 self.assertEqual(Path(cmd[cmd.index("--out") + 1]), pack)
                 builds.append(cmd)
                 (pack / "native_experts.txt").write_bytes(b"rebuilt")
@@ -285,9 +347,89 @@ class Setup(unittest.TestCase):
             mock.patch.object(setup, "data_folder", return_value=(data, [])),
             mock.patch.object(setup, "download", side_effect=AssertionError("downloaded complete shards")),
             mock.patch.object(setup, "run", build)])
+        self.assertEqual(code, 1, out)
+        self.assertIn("replacement is incomplete", out)
+        self.assertIn("--force-download", out)
+        self.assertEqual(builds, [])
+        self.assertTrue(pending.exists())
+
+        restored = gguf_bytes()[:-1] + b"y"
+        calls.clear()
+
+        def download_all(url, dst, what=None, **kwargs):
+            self.assertTrue(pending.exists())
+            self.assertTrue(kwargs["force"])
+            calls.append(dst)
+            dst.write_bytes(restored)
+            setup.mark(dst)
+
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--force-download", "--vision", "none"], extra=[
+            mock.patch.object(setup, "data_folder", return_value=(data, [])),
+            mock.patch.object(setup, "download", download_all), mock.patch.object(setup, "run", build)])
         self.assertEqual(code, 0, out)
+        self.assertEqual(calls, self.shards)
+        self.assertTrue(all(shard.read_bytes() == restored for shard in self.shards))
         self.assertEqual(len(builds), 1)
+        self.assertFalse(pending.exists())
         self.assertEqual((pack / "keep.txt").read_bytes(), b"old cache")
+
+    def test_encoder_failure_keeps_the_replacement_marker(self):
+        data, pack = self.old_pack()
+        pending = self.shards[0].parent / setup.REPLACEMENT_INCOMPLETE
+
+        def download(url, dst, what=None, **kwargs):
+            self.assertTrue(pending.exists())
+            if what == "vision encoder":
+                raise SystemExit(1)
+            dst.write_bytes(gguf_bytes())
+            setup.mark(dst)
+
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--force-download", "--vision", "cpu"], extra=[
+            mock.patch.object(setup, "data_folder", return_value=(data, [])),
+            mock.patch.object(setup, "download", download),
+            mock.patch.object(setup, "run", side_effect=AssertionError("packed incomplete replacement"))])
+        self.assertEqual(code, 1, out)
+        self.assertTrue(pending.exists())
+        self.assertFalse((pack / "native_experts.txt").exists())
+
+    def test_pack_failure_after_full_replacement_allows_a_normal_retry(self):
+        data, pack = self.old_pack()
+        pending = self.shards[0].parent / setup.REPLACEMENT_INCOMPLETE
+
+        def download(url, dst, what=None, **kwargs):
+            dst.write_bytes(gguf_bytes())
+            setup.mark(dst)
+
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--force-download", "--vision", "none"], extra=[
+            mock.patch.object(setup, "data_folder", return_value=(data, [])),
+            mock.patch.object(setup, "download", download),
+            mock.patch.object(setup, "run", side_effect=SystemExit(1))])
+        self.assertEqual(code, 1, out)
+        self.assertFalse(pending.exists())
+        builds = mock.Mock()
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--vision", "none"], extra=[
+            mock.patch.object(setup, "data_folder", return_value=(data, [])),
+            mock.patch.object(setup, "download", side_effect=AssertionError("downloaded complete replacement")),
+            mock.patch.object(setup, "run", builds)])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(any("iq_pack.py" in call.args[0][1] for call in builds.call_args_list))
+
+    def test_shared_shards_from_an_incomplete_replacement_are_not_reused(self):
+        self.shards[1].unlink()
+        source = self.models / "IQ2_XS" / setup.model_file(self.fam, "IQ2_XS", 2)
+        source.parent.mkdir()
+        source.write_bytes(b"incomplete replacement's shared shard")
+        setup.mark(source)
+        (source.parent / setup.REPLACEMENT_INCOMPLETE).touch()
+        download = mock.Mock()
+        link = mock.Mock()
+        code, out, _, _ = install(self.ram, self.cards, [*self.argv, "--vision", "none"], extra=[
+            mock.patch.object(setup, "whole_shard", return_value=True),
+            mock.patch.object(setup, "download", download), mock.patch.object(setup.os, "link", link)
+        ])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(download.call_args.args[1], self.shards[1])
+        link.assert_not_called()
 
     def test_force_passes_pinned_hashes_to_staged_validation(self):
         for shard in self.shards:
@@ -311,7 +453,7 @@ class Setup(unittest.TestCase):
     def test_disk_check_counts_missing_shards_and_replacement_space(self):
         fam = setup.FAMILIES["unsloth"]
         for i in (1, 3):
-            shard = self.models / "UD-IQ4_XS" / setup.model_file(fam, "UD-IQ4_XS", i)
+            shard = self.models / "unsloth-UD-IQ4_XS" / setup.model_file(fam, "UD-IQ4_XS", i)
             shard.parent.mkdir(parents=True, exist_ok=True)
             with shard.open("wb") as f:
                 f.truncate(fam["sha256"][shard.name][0])  # sparse files: real sizes without allocating 44 GB
@@ -325,6 +467,29 @@ class Setup(unittest.TestCase):
         self.assertIn("not enough free disk space", out)
         self.assertIn("need ~96 GB", out)
         download.assert_not_called()
+
+    def test_disk_check_allows_a_missing_last_shard_when_the_peak_fits(self):
+        fam = setup.FAMILIES["unsloth"]
+        for i in (1, 2):
+            shard = self.models / "unsloth-UD-IQ4_XS" / setup.model_file(fam, "UD-IQ4_XS", i)
+            shard.parent.mkdir(parents=True, exist_ok=True)
+            with shard.open("wb") as f:
+                f.truncate(fam["sha256"][shard.name][0])
+            setup.mark(shard)
+
+        def prebuilt(*args, **kwargs):
+            engine = setup.ROOT / "engine"
+            (engine / "BUILD.json").write_text('{"version": "0.1.40", "source": "local"}')
+            return engine
+
+        download = mock.Mock()
+        code, out, _, _ = install(self.ram, self.cards, ["--models-dir", str(self.models), "--family", "unsloth",
+            "--model", "UD-IQ4_XS", "--force-download", "--vision", "none", "--no-start"], extra=[
+                mock.patch.object(setup, "free_gb", return_value=60),
+                mock.patch.object(setup, "get_prebuilt", prebuilt),
+                mock.patch.object(setup, "download", download)])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(download.call_count, 3)
 
     def test_disk_check_reserves_space_to_rebuild_a_forced_pack(self):
         data, pack = self.old_pack()

@@ -284,9 +284,14 @@ On Windows use `START-HERE.bat` with the same flags. Name `--family` too for Swi
 the selected model's shards and its enabled vision encoder afresh, even when completion marks or matching sizes
 are present, and rebuilds the prepared pack from the new files. Each old file and its finish mark stay until
 the staged replacement passes its GGUF and available published or pinned SHA-256 checks. The pack is invalidated
-before any shard changes, so a failed replacement's normal setup retry rebuilds it. Fresh transfers need room
-for missing shards, the old shard and its replacement together, and pack regeneration. The flag does not replace
-the shared MTP draft layer or engine. It cannot be combined with `--gguf-dir`, `--check`, `--update` or
+before any shard changes. A `.strata-replacement-incomplete` file stays in the model folder until every shard
+and the enabled vision encoder pass their checks. If replacement stops early, normal setup refuses to repack
+that folder: rerun the same command with `--force-download` to replace the entire set. Once the files pass their
+checks, a failed pack build can retry with normal setup. Fresh transfers need room for the peak allocation in
+shard order (a staged shard adds space, then its old file is released), plus pack regeneration. Pinned sizes or
+the source's reported file sizes determine the estimate; if a source reports no size, setup uses a conservative
+estimate. Hard links and symlinks whose targets remain on disk do not count as released space. The flag does not
+replace the shared MTP draft layer or engine. It cannot be combined with `--gguf-dir`, `--check`, `--update` or
 `--rollback-engine`.
 
 **Model files downloaded by hand, or from a mirror (#495):** setup's step 5 prints the folder it expects them in
