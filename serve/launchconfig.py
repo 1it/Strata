@@ -104,6 +104,8 @@ def network(host, key):
         raise ValueError("host must be an address, such as 127.0.0.1 or 0.0.0.0")
     if not isinstance(key, str):
         raise ValueError("api_key must be a string")
+    if ":" in host:
+        raise ValueError("IPv6 hosts are not supported by the server listener; use an IPv4 address or hostname")
     try:
         local = ipaddress.ip_address(host).is_loopback
     except ValueError:

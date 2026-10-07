@@ -3,6 +3,7 @@
 After installing with `./setup.sh` (Windows: `START-HERE.bat`), you can keep everyday launch settings in YAML
 and start with `make run`. The launcher uses the engine, model paths and GPU choices saved by setup. It starts
 the server directly; it does not check for updates, compile, install packages or download models.
+Starting restores the model's saved draft-vocabulary subset from the shipped files; a custom subset is kept.
 
 From the Strata folder:
 
@@ -64,6 +65,7 @@ Both commands also accept `--config coder.yaml` when using `run.py` directly.
 ## Access from other devices
 
 Local launches default to `127.0.0.1`, even if the installed JSON config previously used a network address.
+The server listens on IPv4; `make check` rejects IPv6 addresses.
 To allow other devices, set these keys in `strata.yaml`:
 
 ```yaml

@@ -22,14 +22,14 @@ from test_setup_golden import PROFILES, install  # noqa: E402
 from test_setup_pins import Response  # noqa: E402
 
 
-def gguf_bytes(template=None):
-    data = bytearray(struct.pack("<IIQQ", 0x46554747, 3, 2, int(template is not None)))
+def gguf_bytes(template=None, tensors=2):
+    data = bytearray(struct.pack("<IIQQ", 0x46554747, 3, tensors, int(template is not None)))
     if template is not None:
         key, value = b"tokenizer.chat_template", template.encode()
         data += struct.pack("<Q", len(key)) + key + struct.pack("<IQ", 8, len(value)) + value
-    for i, name in enumerate(("blk.0.attn_q.weight", "blk.0.attn_k.weight")):
+    for i, name in enumerate(("blk.0.attn_q.weight", "blk.0.attn_k.weight")[:tensors]):
         data += struct.pack("<Q", len(name)) + name.encode() + struct.pack("<IQIQ", 1, 8, 0, 32 * i)
-    return bytes(data) + bytes(-len(data) % 32 + 64)
+    return bytes(data) + bytes(-len(data) % 32 + 32 * tensors)
 
 
 class Downloads(unittest.TestCase):
@@ -100,8 +100,9 @@ class Downloads(unittest.TestCase):
 
     def test_invalid_forced_replacements_preserve_the_file_and_mark(self):
         expected = (len(self.original), hashlib.sha256(self.original).hexdigest())
+        invalid_type = struct.pack("<IIQQQ", 0x46554747, 3, 0, 1, 1) + b"x" + struct.pack("<I", 99)
         cases = ((self.original[:-1] + b"x", expected), (self.original, (len(self.original) + 1, expected[1])),
-                 (b"invalid GGUF".ljust(len(self.original), b"x"), None))
+                 (b"invalid GGUF".ljust(len(self.original), b"x"), None), (invalid_type, None))
         for data, pinned in cases:
             for local in (False, True):
                 with self.subTest(pinned=pinned, local=local):
@@ -116,6 +117,21 @@ class Downloads(unittest.TestCase):
                                        force=True, expected=pinned)
                     self.assertEqual(self.dst.read_bytes(), self.original)
                     self.assertEqual(self.dst.with_name("model.gguf.done").read_text(), "old marker")
+
+    def test_overlong_single_tensor_replacement_preserves_the_original(self):
+        data = gguf_bytes(tensors=1) + bytes(64)
+        src = self.root / "mirror.gguf"
+        src.write_bytes(data)
+        self.assertTrue(setup.whole_shard(src))        # minimum length alone misses the PLE trailing-data rule
+        for local in (False, True):
+            with self.subTest(local=local):
+                self.dst.write_bytes(self.original)
+                setup.mark(self.dst, "original verified marker")
+                with mock.patch.object(setup.urllib.request, "urlopen", side_effect=lambda *a, **k: Response(data)), \
+                        self.assertRaises(SystemExit):
+                    setup.download(str(src) if local else "https://example.com/model.gguf", self.dst, force=True)
+                self.assertEqual(self.dst.read_bytes(), self.original)
+                self.assertEqual(self.dst.with_name("model.gguf.done").read_text(), "original verified marker")
 
     def test_modelscope_hash_is_checked_before_a_forced_replacement(self):
         new = self.original[:-1] + b"x"

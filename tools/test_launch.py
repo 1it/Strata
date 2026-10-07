@@ -95,7 +95,7 @@ class Launch(unittest.TestCase):
                 launchconfig.load(self.path, self.root)
 
     def test_lan_needs_a_key_and_environment_keys_are_not_written(self):
-        for host in ("0.0.0.0", "192.168.1.10", "::", "server.lan"):
+        for host in ("0.0.0.0", "192.168.1.10", "server.lan"):
             with self.subTest(host=host), self.assertRaisesRegex(ValueError, "requires an API key"):
                 self.write(host=host)
         with self.assertRaisesRegex(ValueError, "requires an API key"):
@@ -112,6 +112,16 @@ class Launch(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "STRATA_API_KEY is empty"):
             self.write()
         self.assertEqual(self.write(api_key_env="OTHER_KEY")["api_key"], "custom-token")
+
+    def test_ipv6_hosts_are_rejected_with_or_without_a_key(self):
+        for host in ("::1", "::", "2001:db8::1", "::ffff:127.0.0.1", "fe80::1%lo", "[::1]"):
+            for key in ("", "test-key"):
+                with self.subTest(host=host, key=key), self.assertRaisesRegex(ValueError, "IPv6"):
+                    self.write(host=host, api_key=key)
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit) as refused:
+            run.main(["check", "--config", str(self.path)])
+        self.assertEqual(refused.exception.code, 2)
+        self.assertIn("IPv6", error.getvalue())
 
     def test_extended_context_reuses_only_a_covering_rope_configuration(self):
         with self.assertRaisesRegex(ValueError, "RoPE"):
@@ -160,6 +170,55 @@ class Launch(unittest.TestCase):
             self.assertEqual(run.main(["run", "--config", str(self.path)]), 0)
             main.assert_called_once_with(["--engine", "strata", "--config", str(self.path)])
 
+    def test_run_restores_each_models_saved_draft_subset_and_preserves_custom_files(self):
+        import setup
+
+        (self.root / "engine").mkdir()
+        (self.root / "engine/strata").touch()
+        (self.root / "tokenizer").mkdir()
+        for name in ("vocab.json", "merges.txt", "token_type.json"):
+            (self.root / "tokenizer" / name).touch()
+        rt = self.root / "mtp/rt"
+        rt.mkdir(parents=True)
+        shipped = self.root / "data"
+        shipped.mkdir()
+        subsets = {"cjk": b"shipped cjk", "en": b"shipped en", "fr": b"shipped fr"}
+        for choice, contents in subsets.items():
+            (shipped / setup.DRAFT_VOCABS[choice]).write_bytes(contents)
+        active = rt / "draft_vocab.bin"
+        active.write_bytes(subsets["cjk"])
+        self.cfg["args"] += ["--mtp", "mtp/rt"]
+        self.cfg["draft_vocab"] = "en"
+        self.base.write_text(json.dumps(self.cfg))
+        other = self.root / "strata-swift-iq3_s.json"
+        second = {**self.cfg, "draft_vocab": "fr", "args": [*self.cfg["args"][:-2], "--mtp=mtp/rt"]}
+        other.write_text(json.dumps(second))
+        self.write()
+        with mock.patch.object(setup, "ROOT", self.root), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(run.main(["check", "--config", str(self.path)]), 0)
+            self.assertEqual(active.read_bytes(), subsets["cjk"])
+            from serve import server
+            for config, expected in ((self.base, subsets["en"]), (other, subsets["fr"]),
+                                     (self.base, subsets["en"])):
+                self.path.write_text(f"config: {config.name}\n")
+
+                def start(args):
+                    self.assertEqual(active.read_bytes(), expected)  # restored before the engine can start
+                    return 0
+
+                with mock.patch.object(server, "main", side_effect=start):
+                    self.assertEqual(run.main(["run", "--config", str(self.path)]), 0)
+            self.cfg.pop("draft_vocab")
+            self.base.write_text(json.dumps(self.cfg))
+            with mock.patch.object(server, "main", return_value=0):
+                self.assertEqual(run.main(["run", "--config", str(self.path)]), 0)
+            self.assertEqual(active.read_bytes(), subsets["cjk"])
+            active.write_bytes(b"user supplied custom subset")
+            self.path.write_text(f"config: {other.name}\n")
+            with mock.patch.object(server, "main", return_value=0):
+                self.assertEqual(run.main(["run", "--config", str(self.path)]), 0)
+            self.assertEqual(active.read_bytes(), b"user supplied custom subset")
+
     def test_init_never_overwrites_and_uses_an_installed_name(self):
         with mock.patch.object(launchconfig, "installed", return_value={"coder-q2_0": self.base}), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -198,6 +257,15 @@ class Launch(unittest.TestCase):
                 contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             server.main(["--engine", "mock", "--config", str(self.path), "--api-key", "cli-secret"])
         self.assertEqual(listener.call_args.args[0], ("0.0.0.0", 8081))
+
+    def test_cli_ipv6_override_is_rejected_before_binding(self):
+        self.write()
+        from serve import server
+        with mock.patch.object(server, "Server", side_effect=AssertionError("IPv6 reached the listener")) as listener, \
+                contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+            server.main(["--engine", "mock", "--config", str(self.path), "--host", "::1", "--api-key", "test-key"])
+        listener.assert_not_called()
+        self.assertIn("IPv6", error.getvalue())
 
     def test_server_uses_yaml_port_and_key_and_saves_settings_over_http(self):
         with socket.socket() as probe:

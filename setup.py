@@ -1330,9 +1330,8 @@ def finish_download(part: Path, dst: Path, *, force=False, expected=None, meta=N
     """Validate staged bytes before replacing a file or its finish mark."""
     staged_mark = part.with_name(part.name + ".done")
     staged_mark.unlink(missing_ok=True)               # never trust a hash cached for an earlier .part
-    if force and dst.suffix.lower() == ".gguf" and not whole_shard(part):
-        fail(f"{dst.name}: the downloaded replacement is not a whole GGUF file; existing file left unchanged",
-             "check the download source and run setup again")
+    if force and dst.suffix.lower() == ".gguf":
+        check_shards([part])                         # all structural rules must pass before the original changes
     for check in (meta, expected):
         if check is not None and check[1]:
             verify_sha256(part, *check)
@@ -1569,7 +1568,7 @@ def check_shards(shards):
             fail(f"missing {s}")
         try:
             g = GGUFFile(s)
-        except (ValueError, struct.error) as e:
+        except (OSError, ValueError, KeyError, struct.error) as e:
             fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
         need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
         have = s.stat().st_size

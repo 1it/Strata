@@ -62,6 +62,12 @@ def main(argv=None) -> int:
         if a.command == "check":
             print("Launch config, engine and tokenizer checked; the GPU and model were not loaded.")
             return 0
+        mtp = launchconfig.arg_value(cfg["args"], "--mtp")
+        if mtp is not None:
+            from setup import refresh_draft_vocab
+            rt = Path(mtp)
+            rt = rt if rt.is_absolute() else Path(cfg["cwd"]) / rt
+            refresh_draft_vocab(rt, cfg.get("draft_vocab", "cjk"))
         # Stay in the foreground: the server owns Ctrl+C/SIGTERM and closes its engine on exit.
         os.chdir(ROOT)
         from serve import server
